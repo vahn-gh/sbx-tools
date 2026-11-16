@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# sbx ls            - test all servers, sorted by latency
+# sbx use <name>    - switch to server (substring match), "auto" = fastest
+# sbx now           - show current server
+# env: JOBS=16 DELAY_TIMEOUT_MS=15000 RETRIES=1 (re-test dead servers N more times)
+
+set -euo pipefail
+
+API="${SBX_API:-http://127.0.0.1:9090}"
+GROUP="proxy"
+TEST_URL="https://www.gstatic.com/generate_204"
+JOBS="${JOBS:-16}"                                # servers tested in parallel
+DELAY_TIMEOUT_MS="${DELAY_TIMEOUT_MS:-15000}"     # per-server test timeout (sent to the API)
+CURL_MAX="${CURL_MAX:-$(( DELAY_TIMEOUT_MS / 1000 + 2 ))}"  # seconds curl waits for one test
+RETRIES="${RETRIES:-1}"                           # extra passes over servers that came back dead
+
+log() {
+  echo "$@" >&2
+}
+
+enc() {
+  jq -rn --arg s "$1" '$s | @uri'
+}
+
+api() {
+  curl -sS -m 5 "$@"
+}
+
+# all entries of the main group (servers and sub-groups like "auto")
+names() {
+  api "${API}/proxies/${GROUP}" | jq -r '.all[]'
+}
+
+# real servers only: skip sub-groups, direct, reject, etc.
+server_names() {
+  api "${API}/proxies" | jq -r --arg g "$GROUP" '
+    .proxies as $p
+    | $p[$g].all[]
+    | select(($p[.].type // "") | test("selector|urltest|fallback|loadbalance|direct|reject|block|dns"; "i") | not)'
+}
+
+# test one server: log progress to stderr, print "<delay_ms or dead><TAB><name>" to stdout
+probe() {
+  local name="$1" d
+  d=$(curl -s -m "$CURL_MAX" \
+        "${API}/proxies/$(enc "$name")/delay?url=$(enc "$TEST_URL")&timeout=${DELAY_TIMEOUT_MS}" \
+      | jq -r '.delay // empty' 2>/dev/null || true)
+  if [[ -n "$d" ]]; then
+    printf '  [%5s ms] %s\n' "$d" "$name" >&2
+  else
+    printf '  [ dead   ] %s\n' "$name" >&2
+  fi
+  printf '%s\t%s\n' "${d:-dead}" "$name"
+}
+export -f probe enc
+export API TEST_URL DELAY_TIMEOUT_MS CURL_MAX
+
+# test a newline-separated list of names in parallel, print probe results
+# tr + xargs -0 -n 1 works with both GNU (Linux) and BSD (macOS) xargs
+probe_all() {
+  printf '%s\n' "$1" | grep . | tr '\n' '\0' \
+    | xargs -0 -n 1 -P "$JOBS" bash -c 'probe "$1"' _
+}
+
+case "${1:-}" in
+  ls)
+    log "Start: fetching server list from ${API}"
+    list=$(server_names) || { log "Error: cannot reach API at ${API}"; exit 1; }
+    total=$(printf '%s\n' "$list" | grep -c . || true)
+    if [[ "$total" -eq 0 ]]; then
+      log "Error: no servers found in group '${GROUP}'"
+      exit 1
+    fi
+    log "Start: testing ${total} servers (${JOBS} at a time, ${CURL_MAX}s max each, ${RETRIES} retry pass(es) for dead)"
+
+    SECONDS=0
+    results=$(probe_all "$list")
+
+    for (( r = 1; r <= RETRIES; r++ )); do
+      dead_list=$(printf '%s\n' "$results" | awk -F'\t' '$1 == "dead" { print $2 }')
+      [[ -z "$dead_list" ]] && break
+      log ""
+      log "Retry ${r}/${RETRIES}: re-testing $(printf '%s\n' "$dead_list" | grep -c .) dead servers"
+      retried=$(probe_all "$dead_list")
+      results=$({ printf '%s\n' "$results" | awk -F'\t' '$1 != "dead"'; printf '%s\n' "$retried"; } | grep . || true)
+    done
+
+    alive=$(printf '%s\n' "$results" | grep -vc '^dead' || true)
+    dead=$(( total - alive ))
+
+    log ""
+    printf '%s\n' "$results" \
+      | awk -F'\t' '{ k = ($1 == "dead") ? 999999 : $1; print k "\t" $0 }' \
+      | sort -t$'\t' -k1,1n \
+      | cut -f2- \
+      | column -t -s $'\t'
+    log ""
+    log "Finish: ${alive} alive, ${dead} dead, ${total} total, ${SECONDS}s"
+    ;;
+
+  use)
+    if [[ -z "${2:-}" ]]; then
+      log "Usage: sbx use <name>"
+      exit 1
+    fi
+
+    log "Start: looking for '$2'"
+    # exact name first, then substring
+    match=$(names | grep -ixF -- "$2" | head -n 1 || true)
+    if [[ -z "$match" ]]; then
+      match=$(names | grep -iF -- "$2" | head -n 1 || true)
+    fi
+    if [[ -z "$match" ]]; then
+      log "Error: no match for '$2'"
+      exit 1
+    fi
+
+    log "Switching to: $match"
+    code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X PUT "${API}/proxies/${GROUP}" \
+      -d "$(jq -n --arg n "$match" '{name: $n}')" || true)
+    if [[ "$code" == "204" || "$code" == "200" ]]; then
+      echo "-> $match"
+      log "Finish: switched"
+    else
+      log "Error: failed to switch (HTTP $code)"
+      exit 1
+    fi
+    ;;
+
+  now)
+    current=$(api "${API}/proxies/${GROUP}" | jq -r '.now')
+    if [[ "$current" == "auto" ]]; then
+      echo "auto -> $(api "${API}/proxies/auto" | jq -r '.now')"
+    else
+      echo "$current"
+    fi
+    ;;
+
+  *)
+    sed -n '2,5p' "$0"
+    ;;
+esac
