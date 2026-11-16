@@ -7,6 +7,9 @@
 # e.g. "vless | PL / VLESS (WS+TLS) #2 pl-globalcdn1.example.org"):
 #   --include 'cdn|PL /'   keep only matching servers
 #   --exclude 'hysteria2'  drop matching servers (applied after --include)
+# direct routing (domains + GeoIP of one country bypass the proxy):
+#   --country ru   (default) needs /etc/sing-box/geoip-ru.srs
+#   --country none send everything through the proxy
 import argparse
 import base64
 import json
@@ -15,6 +18,16 @@ import re
 import sys
 import urllib.request
 from urllib.parse import parse_qs, unquote, urlparse
+
+# TLDs a country uses besides ".<code>" (IDN ones in punycode)
+EXTRA_TLDS = {
+    "ru": ["xn--p1ai"],  # .рф
+    "by": ["xn--90ais"],  # .бел
+    "ua": ["xn--j1amh"],  # .укр
+    "kz": ["xn--80ao21a"],  # .қаз
+    "rs": ["xn--90a3ac"],  # .срб
+    "gb": ["uk"],
+}
 
 
 def b64(s):
@@ -197,7 +210,18 @@ ap.add_argument(
     metavar="REGEX",
     help='drop servers whose "<tag> <server>" matches',
 )
+ap.add_argument(
+    "--country",
+    metavar="CODE",
+    default="ru",
+    help="two-letter country code whose domains and IPs go direct "
+    "(default: ru; needs /etc/sing-box/geoip-<code>.srs), "
+    "or 'none' to send everything through the proxy",
+)
 args = ap.parse_args()
+cc = args.country.lower()
+if cc != "none" and not re.fullmatch(r"[a-z]{2}", cc):
+    ap.error("--country must be a two-letter code or 'none'")
 try:
     inc = re.compile(args.include, re.I) if args.include else None
     exc = re.compile(args.exclude, re.I) if args.exclude else None
@@ -253,7 +277,20 @@ if not outs:
 
 tags = [o["tag"] for o in outs]
 kept = f"{len(tags)}/{total}" if len(tags) != total else f"{total}"
-print(f"{kept} outbounds, mode: {args.mode}", file=sys.stderr)
+print(f"{kept} outbounds, mode: {args.mode}, direct: {cc}", file=sys.stderr)
+
+if cc == "none":
+    direct_suffixes, geoip = [], None
+else:
+    direct_suffixes = [f".{t}" for t in [cc, *EXTRA_TLDS.get(cc, [])]]
+    geoip = f"/etc/sing-box/geoip-{cc}.srs"
+    if not os.path.exists(geoip):
+        print(
+            f"warning: {geoip} not found, sing-box won't start without it:\n"
+            f"  sudo curl -L -o {geoip} https://raw.githubusercontent.com/"
+            f"SagerNet/sing-geoip/rule-set/geoip-{cc}.srs",
+            file=sys.stderr,
+        )
 
 mixed = {
     "type": "mixed",
@@ -288,7 +325,11 @@ cfg = {
             {"type": "https", "tag": "remote", "server": "1.1.1.1", "detour": "proxy"},
             {"type": "local", "tag": "local"},
         ],
-        "rules": [{"domain_suffix": [".ru", ".xn--p1ai"], "server": "local"}],
+        "rules": (
+            [{"domain_suffix": direct_suffixes, "server": "local"}]
+            if direct_suffixes
+            else []
+        ),
         "final": "remote",
         "strategy": "ipv4_only",
     },
@@ -316,17 +357,27 @@ cfg = {
             {"action": "sniff"},
             *([{"protocol": "dns", "action": "hijack-dns"}] if tun else []),
             {"ip_is_private": True, "outbound": "direct"},
-            {"domain_suffix": [".ru", ".xn--p1ai"], "outbound": "direct"},
-            {"rule_set": "geoip-ru", "outbound": "direct"},
+            *(
+                [
+                    {"domain_suffix": direct_suffixes, "outbound": "direct"},
+                    {"rule_set": f"geoip-{cc}", "outbound": "direct"},
+                ]
+                if geoip
+                else []
+            ),
         ],
-        "rule_set": [
-            {
-                "type": "local",
-                "tag": "geoip-ru",
-                "format": "binary",
-                "path": "/etc/sing-box/geoip-ru.srs",
-            }
-        ],
+        "rule_set": (
+            [
+                {
+                    "type": "local",
+                    "tag": f"geoip-{cc}",
+                    "format": "binary",
+                    "path": geoip,
+                }
+            ]
+            if geoip
+            else []
+        ),
         "final": "proxy",
         "auto_detect_interface": True,
         "default_domain_resolver": "local",
